@@ -3,19 +3,26 @@
     "project": "boran",
     "platform": "macOS ARM64",
     "game": "League of Legends",
-    "description": "Keşfedilen memory offset'leri. Scanner araçları tarafından güncellenir."
+    "patch": "2026-04-03",
+    "description": "Keşfedilen memory offset'leri. hero_dumper diagnostik ile doğrulandı."
   },
   "pointer_chain": {
-    "GlobalPage": {"offset": "0x2300000", "from": "base", "type": "ptr"},
-    "HeroManager": {"offset": "0x458", "from": "GlobalPage", "type": "ptr"},
+    "GlobalPage": {"offset": "0x22FC000", "from": "base", "type": "ptr", "method": "ADRP scan", "note": "dinamik keşif, patch'e göre değişir"},
+    "HeroManager": {"offset": "0x478", "from": "GlobalPage", "type": "ptr", "method": "struct validation"},
     "HeroArray": {"offset": "0x8", "from": "HeroManager", "type": "ptr"},
     "HeroCount": {"offset": "0x10", "from": "HeroManager", "type": "u32"}
   },
   "hero_fields": {
-    "ChampionName": {"offset": "0x3758", "type": "ptr->string"},
-    "HP": {"offset": "0x3704", "type": "float"},
-    "MaxHP": {"offset": "0x3708", "type": "float"},
-    "Team": {"offset": "0x3C", "type": "u32"},
-    "AttackRange": {"offset": "0xF54", "type": "float", "verified": false, "note": "kuki referans, boran ile doğrulanacak"}
+    "AttackRange": {"offset": "0xF54", "type": "float", "verified": true, "value_seen": 550.0, "hero": "MissFortune"},
+    "HP": {"offset": "0x36FC", "type": "float", "verified": true, "value_seen": 635.0, "hero": "MissFortune"},
+    "MaxHP": {"offset": "0x3700", "type": "float", "verified": true, "value_seen": 635.0, "hero": "MissFortune"},
+    "ChampionName": {"offset": "0x3750", "type": "ptr->string", "verified": true, "value_seen": "MissFortune"},
+    "DisplayName": {"offset": "0x3A38", "type": "ptr->string", "verified": true, "value_seen": "Miss Fortune"},
+    "BaseArmor": {"offset": "0xF34", "type": "float", "verified": true, "value_seen": 25.0},
+    "BaseMR": {"offset": "0xF3C", "type": "float", "verified": true, "value_seen": 30.0},
+    "BaseAD": {"offset": "0x050C", "type": "float", "verified": true, "value_seen": 52.0},
+    "Mana": {"offset": "0x0208", "type": "float", "verified": true, "value_seen": 300.0},
+    "MaxMana": {"offset": "0x0230", "type": "float", "verified": true, "value_seen": 300.0},
+    "Team": {"offset": "0x20", "type": "u32", "verified": false, "note": "kuki referans"}
   }
 }

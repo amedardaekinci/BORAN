@@ -28,11 +28,13 @@ from core.mem import MemReader, VM_PROT_EXECUTE, VM_PROT_READ
 # Hero object field offset'leri (doğrulama için)
 # ============================================================================
 
-OFF_CHAMPION_NAME = 0x3758        # hero + bu = champion name pointer
-OFF_HP = 0x3704                   # hero + bu = current HP (float)
-OFF_MAX_HP = 0x3708               # hero + bu = max HP (float)
+OFF_CHAMPION_NAME = 0x3750        # hero + bu = champion name pointer (ptr→string)
+OFF_HP = 0x36FC                   # hero + bu = current HP (float)
+OFF_MAX_HP = 0x3700               # hero + bu = max HP (float)
 OFF_ATTACK_RANGE = 0xF54          # hero + bu = attack range (float)
-OFF_TEAM = 0x3C                   # hero + bu = team ID
+OFF_BASE_ARMOR = 0xF34            # hero + bu = base armor (float)
+OFF_BASE_MR = 0xF3C               # hero + bu = base magic resist (float)
+OFF_TEAM = 0x20                   # hero + bu = team flags (u32)
 
 KNOWN_ATTACK_RANGES = {
     125, 150, 175, 200, 225, 250, 300, 325,
@@ -232,11 +234,15 @@ class GlobalPageFinder:
                 continue
 
             hero0 = self.mem.read_u64(arr_ptr)
-            if not (0x100000000 < hero0 < 0x800000000000):
+            if not (0x100000000 < hero0 < 0x900000000000):
                 continue
 
+            # HP ile doğrula — attack range da kontrol et (daha stabil)
             hp = self.mem.read_float(hero0 + OFF_HP)
-            if 0 < hp < 50000:
+            atk_range = self.mem.read_float(hero0 + OFF_ATTACK_RANGE)
+            atk_valid = int(round(atk_range)) in KNOWN_ATTACK_RANGES
+
+            if (0 < hp < 50000) or atk_valid:
                 return off, count, hp
 
         return None

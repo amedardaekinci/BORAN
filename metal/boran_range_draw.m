@@ -28,6 +28,9 @@
 #include <math.h>
 #include <string.h>
 #include <stdint.h>
+#include <signal.h>
+#include <setjmp.h>
+#include <mach/mach.h>
 
 /* ============================================================
  * Offsets — Boran projesinin keşfettiği değerler
@@ -135,44 +138,66 @@ static uint64_t find_game_base(void) {
 }
 
 /* ============================================================
- * GlobalPage Dinamik Keşif (in-process)
+ * Safe memory read — crash-proof via vm_read_overwrite
+ * Kendi process'imizde bile unmapped page'lere erişebiliriz,
+ * bu yüzden vm_read kullanarak güvenli okuma yapıyoruz.
+ * ============================================================ */
+static int safe_read(uint64_t addr, void *buf, size_t size) {
+    vm_size_t out_size = 0;
+    kern_return_t kr = vm_read_overwrite(
+        mach_task_self(), (vm_address_t)addr, (vm_size_t)size,
+        (vm_address_t)buf, &out_size);
+    return (kr == KERN_SUCCESS && out_size == (vm_size_t)size);
+}
+
+static uint64_t safe_read_u64(uint64_t addr) {
+    uint64_t val = 0;
+    safe_read(addr, &val, 8);
+    return val;
+}
+
+static uint32_t safe_read_u32(uint64_t addr) {
+    uint32_t val = 0;
+    safe_read(addr, &val, 4);
+    return val;
+}
+
+static float safe_read_float(uint64_t addr) {
+    float val = 0;
+    safe_read(addr, &val, 4);
+    return val;
+}
+
+/* ============================================================
+ * GlobalPage Dinamik Keşif (in-process, safe read)
  *
  * Data segment'te HeroManager signature arayan brute-force scan.
- * ADRP tarama yerine basit pointer validation kullanır.
+ * vm_read_overwrite ile güvenli — unmapped page crash etmez.
  * ============================================================ */
 static uint64_t find_global_page(uint64_t base) {
-    /* Data segment tahmini range: base + 0x1F00000 - 0x2400000 */
+    BLOG("Scanning for GlobalPage (base=0x%llx)...", (unsigned long long)base);
+
     for (uint64_t off = 0x1F00000; off <= 0x2500000; off += 0x1000) {
         uint64_t page = base + off;
 
-        /* Bu page'de HeroManager signature ara */
         for (uint64_t hm_off = 0x400; hm_off < 0x600; hm_off += 8) {
-            volatile uint64_t *mgr_slot = (volatile uint64_t *)(page + hm_off);
-            uint64_t mgr_ptr = *mgr_slot;
-
+            uint64_t mgr_ptr = safe_read_u64(page + hm_off);
             if (mgr_ptr < 0x100000000ULL || mgr_ptr > 0x900000000000ULL)
                 continue;
 
-            volatile uint64_t *arr_slot = (volatile uint64_t *)(mgr_ptr + OFF_HERO_ARRAY);
-            volatile uint32_t *cnt_slot = (volatile uint32_t *)(mgr_ptr + OFF_HERO_COUNT);
-
-            uint64_t arr = *arr_slot;
-            uint32_t cnt = *cnt_slot;
+            uint64_t arr = safe_read_u64(mgr_ptr + OFF_HERO_ARRAY);
+            uint32_t cnt = safe_read_u32(mgr_ptr + OFF_HERO_COUNT);
 
             if (arr < 0x100000000ULL || arr > 0x900000000000ULL)
                 continue;
             if (cnt < 1 || cnt > 12)
                 continue;
 
-            /* İlk hero'yu doğrula */
-            volatile uint64_t *hero_slot = (volatile uint64_t *)arr;
-            uint64_t hero0 = *hero_slot;
+            uint64_t hero0 = safe_read_u64(arr);
             if (hero0 < 0x100000000ULL || hero0 > 0x900000000000ULL)
                 continue;
 
-            /* Attack range doğrula */
-            volatile float *range_slot = (volatile float *)(hero0 + OFF_ATTACK_RANGE);
-            float range = *range_slot;
+            float range = safe_read_float(hero0 + OFF_ATTACK_RANGE);
             if (range >= 100.0f && range <= 700.0f) {
                 BLOG("GlobalPage FOUND: 0x%llx (base+0x%llx), HeroMgr at +0x%llx, "
                      "count=%u, range=%.0f",
@@ -184,6 +209,7 @@ static uint64_t find_global_page(uint64_t base) {
             }
         }
     }
+    BLOG("GlobalPage NOT FOUND in scan range");
     return 0;
 }
 
@@ -199,24 +225,25 @@ typedef struct {
 static int read_local_hero(hero_data_t *out) {
     if (!g_st.global_page) return 0;
 
-    uint64_t mgr = *(volatile uint64_t *)(g_st.global_page + OFF_HERO_MANAGER_FROM_GP);
+    uint64_t mgr = safe_read_u64(g_st.global_page + OFF_HERO_MANAGER_FROM_GP);
     if (mgr < 0x100000000ULL) return 0;
 
-    uint64_t arr = *(volatile uint64_t *)(mgr + OFF_HERO_ARRAY);
+    uint64_t arr = safe_read_u64(mgr + OFF_HERO_ARRAY);
     if (arr < 0x100000000ULL) return 0;
 
-    uint64_t hero = *(volatile uint64_t *)arr;  /* hero[0] = local player */
+    uint64_t hero = safe_read_u64(arr);  /* hero[0] = local player */
     if (hero < 0x100000000ULL) return 0;
 
     /* Render position (vec3 at hero + 0x98) */
-    volatile float *pos = (volatile float *)(hero + OFF_RENDER_POS);
+    float pos[3];
+    if (!safe_read(hero + OFF_RENDER_POS, pos, 12)) return 0;
     out->pos_x = pos[0];
     out->pos_y = pos[1];
     out->pos_z = pos[2];
 
-    out->hp        = *(volatile float *)(hero + OFF_HP);
-    out->max_hp    = *(volatile float *)(hero + OFF_MAX_HP);
-    out->attack_range = *(volatile float *)(hero + OFF_ATTACK_RANGE);
+    out->hp           = safe_read_float(hero + OFF_HP);
+    out->max_hp       = safe_read_float(hero + OFF_MAX_HP);
+    out->attack_range = safe_read_float(hero + OFF_ATTACK_RANGE);
 
     return 1;
 }
@@ -226,10 +253,9 @@ static int read_local_hero(hero_data_t *out) {
  * ============================================================ */
 static int read_viewproj(float vp[16]) {
     if (!g_st.global_page) return 0;
-    uint64_t cam = *(volatile uint64_t *)(g_st.global_page + OFF_CAMERA);
+    uint64_t cam = safe_read_u64(g_st.global_page + OFF_CAMERA);
     if (cam < 0x100000000ULL || cam > 0x900000000000ULL) return 0;
-    memcpy(vp, (const void *)(cam + OFF_VIEWPROJ), 64);
-    return 1;
+    return safe_read(cam + OFF_VIEWPROJ, vp, 64);
 }
 
 /* ============================================================

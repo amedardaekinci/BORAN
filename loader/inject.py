@@ -244,7 +244,33 @@ def inject_dylib(task, dylib_path, timeout=10.0, verbose=True):
         if kr != 0:
             return False, f"thread_create_running failed (kr={kr})"
 
-        log("Thread oluşturuldu, sonuç bekleniyor...")
+        log(f"Thread oluşturuldu (th={th.value})")
+        log(f"  CODE=0x{CODE:X}, STAGE1=0x{STAGE1:X}, STAGE2=0x{STAGE2:X}")
+        log(f"  DATA=0x{DATA:X}, STACK SP=0x{SP:X}")
+        log(f"  s1={len(s1_bytes)} bytes, s2={len(s2_bytes)} bytes")
+
+        # İlk kısa bekleme — thread'e başlama şansı ver
+        time.sleep(0.1)
+
+        # Thread state kontrol et (crash mi?)
+        libc.thread_get_state.restype = c_int32
+        libc.thread_get_state.argtypes = [c_uint32, c_int32, c_void_p, POINTER(c_uint32)]
+        rs = (c_uint64 * 34)()
+        sc = c_uint32(ARM_THREAD_STATE64_COUNT)
+        kr_ts = libc.thread_get_state(th, ARM_THREAD_STATE64, rs, byref(sc))
+        if kr_ts == 0:
+            pc = rs[32]
+            sp_now = rs[31]
+            log(f"  Thread state: PC=0x{pc:X}, SP=0x{sp_now:X}")
+            spin_addr = STAGE1 + len(s1_bytes) - 4
+            if pc == spin_addr:
+                log(f"  Stage1 spin'de bekliyor ✓")
+            elif STAGE1 <= pc < STAGE1 + len(s1_bytes):
+                log(f"  Stage1 çalışıyor (offset +{pc - STAGE1})")
+            else:
+                log(f"  PC beklenmeyen adreste! (STAGE1=0x{STAGE1:X})")
+        else:
+            log(f"  thread_get_state failed: kr={kr_ts} (thread öldü mü?)")
 
         # Polling
         POLL_INTERVAL = 0.2
@@ -254,24 +280,49 @@ def inject_dylib(task, dylib_path, timeout=10.0, verbose=True):
         for i in range(max_polls):
             time.sleep(POLL_INTERVAL)
 
-            page = _read_remote(task, DATA, 0x18)
-            if page is None:
-                libc.thread_terminate(th)
-                return False, "process öldü"
+            # Data page oku
+            data_ptr = c_void_p(0)
+            data_cnt = c_uint32(0)
+            kr_rd = libc.mach_vm_read(task, c_uint64(DATA), c_uint64(0x18),
+                                       byref(data_ptr), byref(data_cnt))
+            if kr_rd != 0:
+                log(f"  Poll {i+1}: mach_vm_read failed kr={kr_rd}")
+                # Process hala yaşıyor mu kontrol et
+                alive = subprocess.run(['kill', '-0', str(find_pid())],
+                                      capture_output=True).returncode == 0 \
+                        if 'find_pid' in dir() else True
+                # Thread state kontrol
+                sc2 = c_uint32(ARM_THREAD_STATE64_COUNT)
+                kr2 = libc.thread_get_state(th, ARM_THREAD_STATE64, rs, byref(sc2))
+                if kr2 != 0:
+                    log(f"  Thread da öldü (kr={kr2})")
+                    return False, f"process crash — mach_vm_read kr={kr_rd}, thread_get_state kr={kr2}"
+                log(f"  Thread hala yaşıyor, PC=0x{rs[32]:X}")
+                continue
 
+            page = ctypes.string_at(data_ptr.value, min(data_cnt.value, 0x18))
+
+            stage1_res = struct.unpack('<Q', page[0:8])[0]
             done_flag = struct.unpack('<Q', page[8:16])[0]
             dlopen_handle = struct.unpack('<Q', page[16:24])[0]
+
+            if i == 0:
+                log(f"  Poll 1: stage1_result={stage1_res}, done={done_flag}, handle=0x{dlopen_handle:X}")
 
             if done_flag != 0:
                 break
         else:
+            # Timeout — thread state kontrol et
+            sc3 = c_uint32(ARM_THREAD_STATE64_COUNT)
+            libc.thread_get_state(th, ARM_THREAD_STATE64, rs, byref(sc3))
+            log(f"  Timeout! Final PC=0x{rs[32]:X}, stage1_result={stage1_res}")
             libc.thread_terminate(th)
-            return False, f"timeout ({timeout}s)"
+            return False, f"timeout ({timeout}s), PC=0x{rs[32]:X}"
 
         libc.thread_terminate(th)
 
         if dlopen_handle == 0:
-            return False, "dlopen NULL döndürdü"
+            return False, f"dlopen NULL döndürdü (stage1_result={stage1_res})"
 
         elapsed = (i + 1) * POLL_INTERVAL
         log(f"Injection OK! ({elapsed:.1f}s, handle=0x{dlopen_handle:X})")

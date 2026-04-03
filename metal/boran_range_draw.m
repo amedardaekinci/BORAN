@@ -46,9 +46,14 @@
 #define OFF_MAX_HP      0x3700ULL   /* hero + bu = max HP (float) */
 #define OFF_ATTACK_RANGE 0xF54ULL   /* hero + bu = attack range (float) */
 
+/* Hero team offset */
+#define OFF_TEAM        0x20ULL     /* hero + bu = team flags (u32) */
+
 /* Camera/ViewProj — GlobalPage'den relative */
-#define OFF_CAMERA      0xDC8ULL    /* GP + bu = camera ptr */
-#define OFF_VIEWPROJ    0xECULL     /* camera + bu = ViewProj float[16] */
+#define OFF_CAMERA      0xDE8ULL    /* GP + bu = camera ptr (doğrulanmış) */
+#define OFF_VIEWPROJ    0xE8ULL     /* camera + bu = ViewProj float[16] (doğrulanmış) */
+
+#define MAX_HEROES 10
 
 /* ============================================================
  * Logging
@@ -214,38 +219,46 @@ static uint64_t find_global_page(uint64_t base) {
 }
 
 /* ============================================================
- * Hero verilerini oku (in-process, doğrudan memory)
+ * Hero verilerini oku (in-process, tüm hero'lar)
  * ============================================================ */
 typedef struct {
-    float pos_x, pos_y, pos_z;  /* render position */
+    float pos_x, pos_y, pos_z;
     float hp, max_hp;
     float attack_range;
+    uint32_t team;
+    int valid;
 } hero_data_t;
 
-static int read_local_hero(hero_data_t *out) {
+static int read_all_heroes(hero_data_t *heroes, int max_heroes) {
     if (!g_st.global_page) return 0;
 
     uint64_t mgr = safe_read_u64(g_st.global_page + OFF_HERO_MANAGER_FROM_GP);
     if (mgr < 0x100000000ULL) return 0;
 
     uint64_t arr = safe_read_u64(mgr + OFF_HERO_ARRAY);
-    if (arr < 0x100000000ULL) return 0;
+    uint32_t cnt = safe_read_u32(mgr + OFF_HERO_COUNT);
+    if (arr < 0x100000000ULL || cnt < 1) return 0;
+    if (cnt > (uint32_t)max_heroes) cnt = (uint32_t)max_heroes;
 
-    uint64_t hero = safe_read_u64(arr);  /* hero[0] = local player */
-    if (hero < 0x100000000ULL) return 0;
+    int found = 0;
+    for (uint32_t i = 0; i < cnt; i++) {
+        uint64_t hero_ptr = safe_read_u64(arr + i * 8);
+        if (hero_ptr < 0x100000000ULL) continue;
 
-    /* Render position (vec3 at hero + 0x98) */
-    float pos[3];
-    if (!safe_read(hero + OFF_RENDER_POS, pos, 12)) return 0;
-    out->pos_x = pos[0];
-    out->pos_y = pos[1];
-    out->pos_z = pos[2];
-
-    out->hp           = safe_read_float(hero + OFF_HP);
-    out->max_hp       = safe_read_float(hero + OFF_MAX_HP);
-    out->attack_range = safe_read_float(hero + OFF_ATTACK_RANGE);
-
-    return 1;
+        hero_data_t *h = &heroes[found];
+        float pos[3];
+        if (!safe_read(hero_ptr + OFF_RENDER_POS, pos, 12)) continue;
+        h->pos_x = pos[0];
+        h->pos_y = pos[1];
+        h->pos_z = pos[2];
+        h->hp           = safe_read_float(hero_ptr + OFF_HP);
+        h->max_hp       = safe_read_float(hero_ptr + OFF_MAX_HP);
+        h->attack_range = safe_read_float(hero_ptr + OFF_ATTACK_RANGE);
+        h->team         = safe_read_u32(hero_ptr + OFF_TEAM);
+        h->valid        = 1;
+        found++;
+    }
+    return found;
 }
 
 /* ============================================================
@@ -339,56 +352,76 @@ static void build_pipeline_locked(MTLPixelFormat fmt) {
 }
 
 /* ============================================================
- * Range Circle Çizimi — inject_range_circle
+ * Range Circle Çizimi — Tüm Hero'lar
  *
- * Orijinal oyun range circle'ına benzer cyan/mavi renk.
- * 64 segment polyline, world space → NDC projected.
+ * Local player: Cyan (orijinal oyun rengi)
+ * Düşman hero'lar: Kırmızı
+ * Aynı takım: Yeşil
  * ============================================================ */
 static int s_dbg_count = 0;
 
-static void inject_range_circle(id<MTLRenderCommandEncoder> enc) {
-    int dbg = (s_dbg_count++ % 300 == 0);  /* Her 300 frame'de 1 log */
+static void draw_circle_for_hero(boran_vertex_t *verts, int *n,
+                                  const float *vp, const hero_data_t *h,
+                                  float line_w, float cr, float cg, float cb, float ca) {
+    float prev_nx = 0, prev_ny = 0;
+    int   prev_ok = 0;
 
-    /* GlobalPage henüz bulunamadıysa tekrar dene */
+    for (int s = 0; s <= CIRCLE_SEGS; s++) {
+        float angle = (float)s / (float)CIRCLE_SEGS * 6.28318530f;
+        float wx = h->pos_x + cosf(angle) * h->attack_range;
+        float wz = h->pos_z + sinf(angle) * h->attack_range;
+        float cnx, cny;
+        int ok = w2ndc(vp, wx, h->pos_y + 5.0f, wz, &cnx, &cny);
+
+        if (ok && prev_ok) {
+            *n = emit_line(verts, *n,
+                           prev_nx, prev_ny, cnx, cny,
+                           line_w, cr, cg, cb, ca);
+        }
+        prev_nx = cnx;
+        prev_ny = cny;
+        prev_ok = ok;
+    }
+}
+
+static void inject_range_circle(id<MTLRenderCommandEncoder> enc) {
+    int dbg = (s_dbg_count++ % 300 == 0);
+
+    /* GlobalPage */
     if (!g_st.gp_found) {
         g_st.global_page = find_global_page(g_st.game_base);
         if (g_st.global_page) {
             g_st.gp_found = 1;
-            BLOG("GP found in render loop: 0x%llx", (unsigned long long)g_st.global_page);
+            BLOG("GP found: 0x%llx", (unsigned long long)g_st.global_page);
         } else {
-            if (dbg) BLOG("DBG: GP not found yet");
             return;
         }
     }
 
-    /* Hero verilerini oku */
-    hero_data_t hero;
-    if (!read_local_hero(&hero)) {
-        if (dbg) BLOG("DBG: read_local_hero FAILED");
-        return;
-    }
-    if (hero.hp <= 0.0f) {
-        if (dbg) BLOG("DBG: hero.hp=%.1f (dead?)", hero.hp);
-        return;
-    }
-    if (hero.attack_range < 50.0f || hero.attack_range > 2000.0f) {
-        if (dbg) BLOG("DBG: range=%.1f out of bounds", hero.attack_range);
+    /* Tüm hero'ları oku */
+    hero_data_t heroes[MAX_HEROES];
+    memset(heroes, 0, sizeof(heroes));
+    int hero_count = read_all_heroes(heroes, MAX_HEROES);
+    if (hero_count < 1) {
+        if (dbg) BLOG("DBG: no heroes found");
         return;
     }
 
     /* ViewProj matrix */
     float vp[16];
     if (!read_viewproj(vp)) {
-        if (dbg) BLOG("DBG: read_viewproj FAILED (cam offset 0x%llx)",
-                       (unsigned long long)OFF_CAMERA);
+        if (dbg) BLOG("DBG: viewproj FAILED");
         return;
     }
 
-    if (dbg) BLOG("DBG: OK hp=%.0f range=%.0f pos=(%.0f,%.0f,%.0f) vp[0]=%.4f",
-                   hero.hp, hero.attack_range,
-                   hero.pos_x, hero.pos_y, hero.pos_z, vp[0]);
+    /* Local player'ın team'ini al (hero[0] = local) */
+    uint32_t local_team = heroes[0].team;
 
-    /* NDC line width: ~2.5px */
+    if (dbg) BLOG("DBG: %d heroes, local team=%u, hp=%.0f range=%.0f vp[0]=%.2f",
+                   hero_count, local_team,
+                   heroes[0].hp, heroes[0].attack_range, vp[0]);
+
+    /* NDC line width */
     float sw = (float)(g_st.draw_w > 0 ? g_st.draw_w : 1920);
     float sh = (float)(g_st.draw_h > 0 ? g_st.draw_h : 1080);
     float line_w = (2.5f / sw + 2.5f / sh) * 1.0f;
@@ -396,29 +429,29 @@ static void inject_range_circle(id<MTLRenderCommandEncoder> enc) {
     boran_vertex_t *verts = (boran_vertex_t *)g_st.vtx_buf.contents;
     int n = 0;
 
-    /* Range circle — orijinal oyundaki mavi-cyan renk
-     * Oyundaki C tuşu range indicator'ı: açık mavi/cyan, hafif transparan */
-    float prev_nx = 0.0f, prev_ny = 0.0f;
-    int   prev_ok = 0;
-    float range = hero.attack_range;
+    for (int i = 0; i < hero_count; i++) {
+        hero_data_t *h = &heroes[i];
+        if (h->hp <= 0.0f) continue;
+        if (h->attack_range < 50.0f || h->attack_range > 2000.0f) continue;
 
-    for (int s = 0; s <= CIRCLE_SEGS; s++) {
-        float angle = (float)s / (float)CIRCLE_SEGS * 6.28318530f;
-        float wx = hero.pos_x + cosf(angle) * range;
-        float wz = hero.pos_z + sinf(angle) * range;
-        float cnx, cny;
-        int ok = w2ndc(vp, wx, hero.pos_y + 5.0f, wz, &cnx, &cny);
+        float cr, cg, cb, ca;
+        float lw;
 
-        if (ok && prev_ok) {
-            /* Orijinal cyan range circle rengi: RGB(0, 230, 230), alpha 0.8 */
-            n = emit_line(verts, n,
-                          prev_nx, prev_ny, cnx, cny,
-                          line_w * 2.0f,
-                          0.0f, 0.90f, 0.90f, 0.80f);
+        if (i == 0) {
+            /* Local player: Cyan (orijinal oyun rengi) */
+            cr = 0.0f; cg = 0.90f; cb = 0.90f; ca = 0.80f;
+            lw = line_w * 2.5f;
+        } else if (h->team != local_team) {
+            /* Düşman: Kırmızı */
+            cr = 1.0f; cg = 0.20f; cb = 0.20f; ca = 0.70f;
+            lw = line_w * 2.0f;
+        } else {
+            /* Aynı takım: Yeşil (daha ince) */
+            cr = 0.20f; cg = 0.90f; cb = 0.20f; ca = 0.50f;
+            lw = line_w * 1.5f;
         }
-        prev_nx = cnx;
-        prev_ny = cny;
-        prev_ok = ok;
+
+        draw_circle_for_hero(verts, &n, vp, h, lw, cr, cg, cb, ca);
     }
 
     if (n == 0) return;

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Auto Attack v2 — Edge-to-edge range check ile otomatik saldır.
+Auto Attack v3 — Edge-to-edge range + gerçek attack speed/windup.
 
 Mantık:
-1. Hero ve düşman pozisyonlarını oku
-2. Edge-to-edge mesafe hesapla (center_dist - local_radius - enemy_radius)
-3. edge_dist <= attack_range + server_tolerance → A + sol tık (attack-move-click)
+1. Startup: CDragon'dan base AS + windup data çek
+2. Runtime: Live Client API'den güncel attack speed (1Hz background thread)
+3. Edge-to-edge mesafe + attack cooldown (1/AS) + windup timing
 
 Kullanım:
     sudo python3 orbwalker/auto_attack.py
@@ -21,6 +21,8 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from discovery.pointer_chain import HeroResolver
+from core.champion_stats import get_stats_safe
+from core.live_client import LiveClientPoller
 
 
 # ============================================================================
@@ -107,14 +109,39 @@ def distance_2d(x1, z1, x2, z2):
 
 
 # ============================================================================
+# Attack Speed & Windup Hesaplama
+# ============================================================================
+
+def calc_windup_time(base_as, windup, windup_mod, current_as):
+    """
+    Auto-attack windup süresi (saniye).
+    Windup sırasında hareket → AA cancel olur.
+
+    Formül (LoL wiki / VakScript referans):
+    base_windup = (1/base_as) * windup
+    if windup_mod: actual = base_windup + (current_full - base_windup) * windup_mod
+    else: actual = (1/current_as) * windup
+    """
+    base_windup = (1.0 / base_as) * windup
+    current_full = (1.0 / current_as) * windup
+    if windup_mod:
+        return base_windup + (current_full - base_windup) * windup_mod
+    return current_full
+
+
+def calc_attack_cooldown(current_as):
+    """İki AA arası bekleme = 1 / attack_speed."""
+    return 1.0 / current_as
+
+
+# ============================================================================
 # Ana Loop
 # ============================================================================
 
 def main():
     print("=" * 60)
-    print("  BORAN Auto Attack v2")
-    print("  Edge-to-edge range check + server toleransı")
-    print("  Formül: edge_dist <= attack_range + 15")
+    print("  BORAN Auto Attack v3")
+    print("  Edge-to-edge range + real attack speed/windup")
     print("  Durdurmak: Ctrl+C")
     print("=" * 60)
 
@@ -129,7 +156,27 @@ def main():
 
     print(f"[+] {len(heroes)} hero bulundu")
     local = heroes[0]
-    print(f"[+] Local: {local['name']} range={local['attack_range']:.0f}")
+    local_name = local['name']
+    print(f"[+] Local: {local_name} range={local['attack_range']:.0f}")
+
+    # Champion base stats — CDragon API
+    print(f"[*] {local_name} base stats çekiliyor (CDragon)...")
+    base_stats = get_stats_safe(local_name)
+    base_as = base_stats["base_attack_speed"]
+    windup_pct = base_stats["windup_percent"]
+    windup_mod = base_stats["windup_modifier"]
+    print(f"[+] base_AS={base_as:.3f}  windup={windup_pct:.3f}  windup_mod={windup_mod:.3f}")
+
+    # Live Client API poller — background thread
+    poller = LiveClientPoller(poll_interval=1.0)
+    poller.start()
+    print("[*] Live Client API poller başlatıldı (1Hz)")
+    time.sleep(1.5)
+    if poller.is_valid:
+        print(f"[+] Güncel attack speed: {poller.attack_speed:.3f}")
+    else:
+        print(f"[!] Live Client API yanıt yok, base_as={base_as:.3f} kullanılacak")
+
     print(f"[+] Başlatılıyor...\n")
 
     # Offset'ler
@@ -147,7 +194,8 @@ def main():
     # Server toleransı — LoL server ~15 unit leniency verir
     SERVER_TOLERANCE = 15.0
 
-    attack_cooldown = 0
+    can_attack_time = 0.0
+    can_move_time = 0.0
     tick = 0
 
     try:
@@ -177,7 +225,7 @@ def main():
             if not local_pos:
                 time.sleep(0.1)
                 continue
-            lx, ly, lz = struct.unpack('<3f', local_pos)
+            lx, _, lz = struct.unpack('<3f', local_pos)
             local_hp = mem.read_float(local_ptr + OFF_HP)
             local_range = mem.read_float(local_ptr + OFF_RANGE)
             local_team = mem.read_u32(local_ptr + OFF_TEAM)
@@ -193,8 +241,6 @@ def main():
 
             # Düşman hero'ları tara
             closest_dist = 99999
-            closest_center_dist = 99999
-            closest_enemy_radius = DEFAULT_RADIUS
             closest_name = ""
 
             for i in range(1, min(cnt, 12)):
@@ -213,7 +259,7 @@ def main():
                 enemy_pos = mem.read(enemy_ptr + OFF_POS, 12)
                 if not enemy_pos:
                     continue
-                ex, ey, ez = struct.unpack('<3f', enemy_pos)
+                ex, _, ez = struct.unpack('<3f', enemy_pos)
 
                 # Düşman gameplay radius
                 enemy_radius = mem.read_float(enemy_ptr + OFF_GAMEPLAY_RADIUS)
@@ -227,30 +273,44 @@ def main():
 
                 if edge_dist < closest_dist:
                     closest_dist = edge_dist
-                    closest_center_dist = dist
                     closest_name = f"hero[{i}]"
-                    closest_enemy_radius = enemy_radius
 
             # Edge-to-edge range check + server toleransı
-            # LoL formülü: edge_distance <= attack_range + tolerance
             effective_range = local_range + SERVER_TOLERANCE
             in_range = closest_dist <= effective_range
 
+            # Güncel attack speed — API varsa gerçek, yoksa base
+            c_as = poller.attack_speed if poller.is_valid else base_as
+            c_as = max(0.2, min(c_as, 2.5))  # AS cap
+
             if tick % 20 == 0:
-                status = (f"✓ {closest_name} edge={closest_dist:.0f} (center={closest_center_dist:.0f} "
-                          f"r={local_radius:.0f}+{closest_enemy_radius:.0f})" if in_range
-                          else f"  nearest edge={closest_dist:.0f}")
-                print(f"[{tick:5d}] HP:{local_hp:.0f} Range:{local_range:.0f}+{SERVER_TOLERANCE:.0f} {status}")
+                attack_cd = calc_attack_cooldown(c_as)
+                windup_t = calc_windup_time(base_as, windup_pct, windup_mod, c_as)
+                api_tag = "API" if poller.is_valid else "BASE"
+                status = (f"✓ {closest_name} edge={closest_dist:.0f}"
+                          if in_range else f"  nearest edge={closest_dist:.0f}")
+                print(f"[{tick:5d}] HP:{local_hp:.0f} AS={c_as:.2f}({api_tag}) "
+                      f"cd={attack_cd:.2f}s wu={windup_t:.2f}s {status}")
 
             # Saldır!
-            if in_range and now > attack_cooldown:
-                print(f"  >>> ATTACK! {closest_name} edge={closest_dist:.0f} < range={effective_range:.0f}")
+            if in_range and now > can_attack_time:
+                attack_cd = calc_attack_cooldown(c_as)
+                windup_t = calc_windup_time(base_as, windup_pct, windup_mod, c_as)
+                print(f"  >>> ATTACK! {closest_name} edge={closest_dist:.0f} "
+                      f"AS={c_as:.2f} cd={attack_cd:.3f}s windup={windup_t:.3f}s")
                 attack_click()
-                attack_cooldown = now + 0.4  # 0.4sn cooldown (attack speed'e göre ayarlanabilir)
+                can_attack_time = now + attack_cd
+                can_move_time = now + windup_t
+
+            # Windup bitti, hareket edebilirsin (kite window)
+            if can_move_time > 0 and now > can_move_time and now < can_attack_time:
+                right_click_at(960.0, 540.0)  # Kite — ekran ortasına sağ tık
+                can_move_time = 0  # Tek seferde bir kez
 
             time.sleep(0.05)  # 20 tick/sn
 
     except KeyboardInterrupt:
+        poller.stop()
         print("\n[*] Durduruldu.")
 
 

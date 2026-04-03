@@ -23,6 +23,7 @@
     "BaseAD": {"offset": "0x050C", "type": "float", "verified": true, "value_seen": 52.0},
     "Mana": {"offset": "0x0208", "type": "float", "verified": true, "value_seen": 300.0},
     "MaxMana": {"offset": "0x0230", "type": "float", "verified": true, "value_seen": 300.0},
-    "Team": {"offset": "0x20", "type": "u32", "verified": false, "note": "kuki referans"}
+    "Team": {"offset": "0x20", "type": "u32", "verified": false, "note": "kuki referans"},
+    "GameplayRadius": {"offset": "0x3A8", "type": "float", "verified": false, "note": "nOverrideCollisionRadius — kuki referans, macOS'ta doğrulanması gerekli", "expected_range": "50-100"}
   }
 }

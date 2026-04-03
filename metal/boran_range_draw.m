@@ -344,26 +344,49 @@ static void build_pipeline_locked(MTLPixelFormat fmt) {
  * Orijinal oyun range circle'ına benzer cyan/mavi renk.
  * 64 segment polyline, world space → NDC projected.
  * ============================================================ */
+static int s_dbg_count = 0;
+
 static void inject_range_circle(id<MTLRenderCommandEncoder> enc) {
+    int dbg = (s_dbg_count++ % 300 == 0);  /* Her 300 frame'de 1 log */
+
     /* GlobalPage henüz bulunamadıysa tekrar dene */
     if (!g_st.gp_found) {
         g_st.global_page = find_global_page(g_st.game_base);
         if (g_st.global_page) {
             g_st.gp_found = 1;
+            BLOG("GP found in render loop: 0x%llx", (unsigned long long)g_st.global_page);
         } else {
-            return;  /* Henüz bulunamadı */
+            if (dbg) BLOG("DBG: GP not found yet");
+            return;
         }
     }
 
     /* Hero verilerini oku */
     hero_data_t hero;
-    if (!read_local_hero(&hero)) return;
-    if (hero.hp <= 0.0f) return;
-    if (hero.attack_range < 50.0f || hero.attack_range > 2000.0f) return;
+    if (!read_local_hero(&hero)) {
+        if (dbg) BLOG("DBG: read_local_hero FAILED");
+        return;
+    }
+    if (hero.hp <= 0.0f) {
+        if (dbg) BLOG("DBG: hero.hp=%.1f (dead?)", hero.hp);
+        return;
+    }
+    if (hero.attack_range < 50.0f || hero.attack_range > 2000.0f) {
+        if (dbg) BLOG("DBG: range=%.1f out of bounds", hero.attack_range);
+        return;
+    }
 
     /* ViewProj matrix */
     float vp[16];
-    if (!read_viewproj(vp)) return;
+    if (!read_viewproj(vp)) {
+        if (dbg) BLOG("DBG: read_viewproj FAILED (cam offset 0x%llx)",
+                       (unsigned long long)OFF_CAMERA);
+        return;
+    }
+
+    if (dbg) BLOG("DBG: OK hp=%.0f range=%.0f pos=(%.0f,%.0f,%.0f) vp[0]=%.4f",
+                   hero.hp, hero.attack_range,
+                   hero.pos_x, hero.pos_y, hero.pos_z, vp[0]);
 
     /* NDC line width: ~2.5px */
     float sw = (float)(g_st.draw_w > 0 ? g_st.draw_w : 1920);
